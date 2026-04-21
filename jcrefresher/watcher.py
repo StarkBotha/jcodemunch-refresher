@@ -15,7 +15,10 @@ from jcrefresher.worker import WorkerPool
 
 logger = logging.getLogger(__name__)
 
+# How often to re-scan ~/.code-index/ for new or removed repos
 REDISCOVERY_INTERVAL_SECONDS: int = 30
+# Quiet period after the last event on a path before we actually dispatch a job;
+# keeps burst edits (e.g. a save + format on write) from spawning many redundant jobs
 DEBOUNCE_WINDOW_SECONDS: float = 2.0
 
 
@@ -23,6 +26,8 @@ class _RepoEventHandler(watchdog.events.FileSystemEventHandler):
     def __init__(self, source_root: str, debouncer: Debouncer) -> None:
         super().__init__()
         self._source_root = source_root
+        # All repos share a single Debouncer instance so cross-repo event coalescing
+        # works correctly (the path key is globally unique).
         self._debouncer = debouncer
 
     def on_modified(self, event: watchdog.events.FileSystemEvent) -> None:
@@ -30,6 +35,8 @@ class _RepoEventHandler(watchdog.events.FileSystemEventHandler):
         logger.debug("raw event: modified path=%s is_directory=%s", path, event.is_directory)
         if should_ignore(path):
             return
+        # Directory modify events (e.g. mtime change when a file inside is added) get
+        # escalated to dir_event so the dispatcher triggers a full folder reindex.
         if event.is_directory:
             event_type = "dir_event"
         else:
@@ -62,6 +69,8 @@ class _RepoEventHandler(watchdog.events.FileSystemEventHandler):
             event.dest_path,
             event.is_directory,
         )
+        # Index the destination path — the source path no longer exists, so indexing
+        # it would be a no-op or an error.
         path = event.dest_path
         if should_ignore(path):
             return
@@ -76,9 +85,14 @@ class WatchManager:
     def __init__(self, pool: WorkerPool) -> None:
         self._pool = pool
         self._dispatcher = Dispatcher(pool)
+        # Single shared Debouncer: one callback handles events from all watched repos
         self._debouncer = Debouncer(DEBOUNCE_WINDOW_SECONDS, self._on_debounced_event)
+        # watchdog.Observer runs an inotify thread internally; we call schedule/unschedule
+        # from our own threads, which is safe per watchdog's documented API.
         self._observer = watchdog.observers.Observer()
+        # Maps source_root string → (ObservedWatch, RepoRecord) for unschedule bookkeeping
         self._watches: dict[str, tuple[watchdog.observers.api.ObservedWatch, RepoRecord]] = {}
+        # _lock guards _watches; the observer's own internal lock is separate
         self._lock = threading.Lock()
         self._rediscovery_timer: threading.Timer | None = None
 
@@ -91,6 +105,8 @@ class WatchManager:
     def stop(self) -> None:
         if self._rediscovery_timer is not None:
             self._rediscovery_timer.cancel()
+        # flush_all fires any buffered events synchronously before shutdown so we don't
+        # silently drop changes that arrived just before a SIGTERM.
         self._debouncer.flush_all()
         self._debouncer.shutdown()
         self._observer.stop()
@@ -98,6 +114,9 @@ class WatchManager:
         logger.info("WatchManager stopped")
 
     def _schedule_rediscovery(self) -> None:
+        # Use a one-shot Timer that reschedules itself rather than a repeating thread,
+        # so a slow discover_repos() call (e.g. many DB files) never causes overlapping
+        # rediscovery runs.
         timer = threading.Timer(REDISCOVERY_INTERVAL_SECONDS, self._rediscovery_tick)
         timer.daemon = True
         self._rediscovery_timer = timer
@@ -114,7 +133,7 @@ class WatchManager:
         current_roots: set[str] = {str(r.source_root) for r in current_records}
 
         with self._lock:
-            # Add new watches
+            # Add watches for repos that appeared since the last sync
             for record in current_records:
                 root_str = str(record.source_root)
                 if root_str not in self._watches:
@@ -126,7 +145,7 @@ class WatchManager:
                     self._watches[root_str] = (watch, record)
                     logger.info("watch added: source_root=%s db=%s", root_str, record.db_path.name)
 
-            # Remove stale watches
+            # Unschedule watches for repos whose DB files were removed from ~/.code-index/
             stale = [root for root in self._watches if root not in current_roots]
             for root in stale:
                 watch, _ = self._watches[root]
@@ -135,6 +154,8 @@ class WatchManager:
                 logger.info("watch removed: source_root=%s (no longer in index)", root)
 
     def _on_debounced_event(self, path: str, event_type: str) -> None:
+        # Find the longest matching watched root for this path; longest-match wins
+        # so a repo nested inside another repo is always attributed to its own watch.
         with self._lock:
             matched_root: str | None = None
             for root in self._watches:
@@ -143,6 +164,7 @@ class WatchManager:
                         matched_root = root
 
         if matched_root is None:
+            # Can happen if a watch was removed between the event firing and this callback
             logger.warning("debounced event for unmatched path: path=%s event_type=%s", path, event_type)
             return
 

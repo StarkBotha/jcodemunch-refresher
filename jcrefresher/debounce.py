@@ -11,8 +11,11 @@ class Debouncer:
     def __init__(self, window_seconds: float, callback: DebounceCallback) -> None:
         self._window_seconds = window_seconds
         self._callback = callback
+        # One Timer per path; a new event for the same path cancels and replaces it
         self._timers: dict[str, threading.Timer] = {}
+        # _lock guards both _timers and _event_types together — they must stay in sync
         self._lock = threading.Lock()
+        # Stores the "winning" event type that will be passed to the callback when the timer fires
         self._event_types: dict[str, str] = {}
         self._shutdown_flag = False
 
@@ -23,10 +26,17 @@ class Debouncer:
                 return
 
             if path in self._timers:
+                # Cancel the old timer before creating a new one; the cancel() call is
+                # safe even if the timer has already fired — it's a no-op in that case.
+                # However, _fire() acquires _lock before reading _event_types, so if
+                # _fire() already holds the lock it has already popped the entry and
+                # the cancel() here is harmless.
                 self._timers[path].cancel()
                 logger.debug("timer reset for path=%s (new event_type=%s)", path, event_type)
 
-            # Priority rule: dir_event escalates and stays escalated
+            # dir_event means a directory itself changed, which requires a full folder
+            # reindex.  Once escalated to dir_event it must stay that way regardless of
+            # subsequent file-level events in the same debounce window.
             existing = self._event_types.get(path)
             if existing == "dir_event":
                 self._event_types[path] = "dir_event"
@@ -39,6 +49,8 @@ class Debouncer:
             timer.start()
 
     def _fire(self, path: str) -> None:
+        # _fire runs on a Timer thread; acquire the lock to atomically remove both
+        # the timer record and the event type so push() cannot race with a stale entry
         with self._lock:
             event_type = self._event_types.pop(path, None)
             self._timers.pop(path, None)
@@ -48,6 +60,8 @@ class Debouncer:
             self._callback(path, event_type)
 
     def flush_all(self) -> None:
+        # Called during graceful shutdown to drain pending events synchronously
+        # so no indexing work is silently dropped on exit.
         with self._lock:
             pending_count = len(self._timers)
             for timer in self._timers.values():
@@ -62,6 +76,7 @@ class Debouncer:
             self._callback(path, event_type)
 
     def shutdown(self) -> None:
+        # Set the flag under the lock so push() never starts a new timer after this point
         with self._lock:
             self._shutdown_flag = True
             pending_count = len(self._timers)

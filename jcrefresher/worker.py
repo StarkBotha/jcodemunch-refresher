@@ -7,9 +7,12 @@ from enum import Enum, auto
 
 logger = logging.getLogger(__name__)
 
+# uvx resolves and runs jcodemunch-mcp without requiring a fixed install path,
+# which means the daemon works regardless of which virtualenv is active.
 JCODEMUNCH_CMD: str = "uvx"
 JCODEMUNCH_ARGS_FILE: list[str] = ["jcodemunch-mcp", "index-file"]
 JCODEMUNCH_ARGS_FOLDER: list[str] = ["jcodemunch-mcp", "index"]
+# 300s is generous; a large repo full-reindex can be slow on cold disk cache
 SUBPROCESS_TIMEOUT_SECONDS: int = 300
 
 
@@ -21,15 +24,20 @@ class JobKind(Enum):
 @dataclass
 class Job:
     kind: JobKind
-    target: str
+    target: str  # absolute path — either a single file or a repo root
 
 
 class WorkerPool:
     def __init__(self, max_workers: int = 4) -> None:
         self._max_workers = max_workers
+        # Unbounded queue: backpressure is handled by the debounce window upstream,
+        # not here — we never want to block the watchdog observer thread.
         self._queue: queue.Queue[Job | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
+        # Per-target locks prevent two workers from running jcodemunch on the same
+        # file/folder simultaneously, which would cause interleaved index writes.
         self._per_file_locks: dict[str, threading.Lock] = {}
+        # _meta_lock guards _per_file_locks dict itself (not the per-file locks)
         self._meta_lock = threading.Lock()
         self._running = False
 
@@ -48,6 +56,7 @@ class WorkerPool:
 
     def stop(self) -> None:
         self._running = False
+        # Send one sentinel (None) per worker thread to unblock each queue.get()
         for _ in range(self._max_workers):
             self._queue.put(None)
         for t in self._threads:
@@ -61,6 +70,7 @@ class WorkerPool:
         while True:
             item = self._queue.get(block=True)
             if item is None:
+                # Sentinel received — this thread's work is done
                 logger.debug("worker thread %s received sentinel; draining and exiting", thread_name)
                 self._queue.task_done()
                 break
@@ -68,6 +78,8 @@ class WorkerPool:
             self._queue.task_done()
 
     def _run_job(self, job: Job) -> None:
+        # Acquire _meta_lock only long enough to look up or create the per-target lock;
+        # the actual jcodemunch subprocess runs under the narrower per-target lock.
         with self._meta_lock:
             if job.target not in self._per_file_locks:
                 self._per_file_locks[job.target] = threading.Lock()

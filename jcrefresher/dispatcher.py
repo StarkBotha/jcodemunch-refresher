@@ -12,6 +12,10 @@ class Dispatcher:
 
     def dispatch(self, path: str, event_type: str, source_root: str) -> None:
         if event_type in ("dir_event", "file_delete"):
+            # Directory changes and deletions both invalidate the index in ways that
+            # a single-file reindex cannot fix (e.g. a directory rename moves many
+            # files at once, a deletion leaves stale index entries).  The safest
+            # recovery is a full folder reindex of the repo root.
             job = Job(kind=JobKind.FOLDER, target=source_root)
             logger.info(
                 "dispatch: path=%s event_type=%s -> FOLDER job for source_root=%s"
@@ -25,6 +29,8 @@ class Dispatcher:
             logger.debug("enqueuing CLI command: %s", cmd)
             self._pool.enqueue(job)
         else:
+            # file_modify and file_create only affect the single changed file,
+            # so a targeted index-file call is cheaper than a full folder reindex.
             job = Job(kind=JobKind.FILE, target=path)
             logger.info(
                 "dispatch: path=%s event_type=%s -> FILE job"
