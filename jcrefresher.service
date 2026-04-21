@@ -1,0 +1,17 @@
+[Unit]
+Description=jcrefresher - jcodemunch index refresh daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 -m jcrefresher
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jcrefresher
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
