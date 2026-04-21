@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 IGNORED_DIR_NAMES: frozenset[str] = frozenset({
     ".git", "node_modules", "__pycache__", ".venv", ".mypy_cache",
     ".tox", ".eggs", "dist", "build", ".hg", ".svn",
+    "test-results", "coverage", ".nyc_output", "playwright-report",
 })
 
 # Transient files written by editors; indexing them would waste jcodemunch calls
@@ -17,6 +18,15 @@ IGNORED_SUFFIXES: frozenset[str] = frozenset({
     ".swp", ".swo", ".swn",   # vim swap
     ".tmp", ".temp",
     "~",                       # editor backup (trailing tilde)
+    # Binary/media/archive formats that jcodemunch cannot index
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+    ".webm", ".mp4", ".mp3", ".wav", ".ogg",
+    ".pdf",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+    ".db", ".sqlite",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pyc", ".pyo",
 })
 
 
@@ -27,6 +37,9 @@ def should_ignore(path: str | Path) -> bool:
     for part in p.parts:
         if part in IGNORED_DIR_NAMES:
             logger.debug("ignoring %s: path component %r matches ignored dir name", p, part)
+            return True
+        if part.startswith(".playwright"):
+            logger.debug("ignoring %s: path component %r starts with .playwright", p, part)
             return True
 
     if p.suffix in IGNORED_SUFFIXES:
