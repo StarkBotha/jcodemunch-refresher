@@ -1,5 +1,7 @@
 import logging
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,7 +11,22 @@ logger = logging.getLogger(__name__)
 # We poll this directory rather than watch it because inotify on ~/.code-index/
 # would race with jcodemunch itself creating/removing DB files, and the 30-second
 # rediscovery interval is good enough — new repos are watched within half a minute.
-INDEX_DIR: Path = Path.home() / ".code-index"
+def _resolve_index_dir() -> Path:
+    if sys.platform != "win32":
+        return Path.home() / ".code-index"
+    candidates = [
+        Path.home() / ".code-index",
+        Path(os.environ.get("LOCALAPPDATA", "")) / ".code-index",
+        Path(os.environ.get("APPDATA", "")) / ".code-index",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    # None found — fall back to home so the watch manager simply finds no repos
+    return Path.home() / ".code-index"
+
+
+INDEX_DIR: Path = _resolve_index_dir()
 
 
 @dataclass
